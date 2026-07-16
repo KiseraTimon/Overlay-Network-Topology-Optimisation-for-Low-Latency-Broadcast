@@ -1,0 +1,2 @@
+{"event": "DELIVER", "node": 5, "messageId": "1:1001", "originMs": 1784213755282, "recvMs": 1784213755347}
+{"event": "SEND", "node": 5, "messageId": "1:1001", "toNode": 3}
