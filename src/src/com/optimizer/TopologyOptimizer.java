@@ -1,3 +1,5 @@
+package com.optimizer;
+
 /*
  * SECTOR B — TOPOLOGY CONSTRUCTION & OPTIMIZATION (core contribution)
  * ------------------------------------------------------------------
