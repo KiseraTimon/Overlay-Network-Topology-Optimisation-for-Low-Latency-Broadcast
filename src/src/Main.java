@@ -3,7 +3,9 @@ import com.transport.OverlayTransport.*;
 import com.optimizer.TopologyOptimizer.*;
 import com.engine.BroadcastEngine.*;
 
+import java.io.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -12,15 +14,27 @@ public class Main {
         int NUM_NODES = 5;
         int SOURCE_NODE = 1;
         int BASE_PORT = 9000;
+        String STRATEGY = "adaptive_gossip";
 
-        // 1. SECTOR A: Initializing Physical Transport & Latency
+        // JSON logging for Main.py
+        File logDir = new File("logs/" + STRATEGY);
+        if (!logDir.exists()) logDir.mkdirs();
+
+        Map<Integer, PrintWriter> loggers = new HashMap<>();
+        for (int i = 1; i <= NUM_NODES; i++) {
+            loggers.put(i, new PrintWriter(new FileWriter(new File(logDir, "node-" + i + ".log"))));
+        }
+
+        // Tracking when a broadcast originally started so we can calculate latency
+        Map<String, Long> globalOriginTimes = new ConcurrentHashMap<>();
+
+        // 1. SECTOR A: Initialize Physical Transport & Latency
         System.out.println("1. Spinning up Transport Layer (Sector A)");
         LatencyOracle oracle = new LatencyOracle(42L, 0.05, 5.0);
 
         Map<Integer, Node> physicalNodes = new HashMap<>();
         Set<Integer> nodeIds = new HashSet<>();
 
-        // Create and start physical nodes
         for (int i = 1; i <= NUM_NODES; i++) {
             nodeIds.add(i);
             Node node = new Node(i, BASE_PORT + i, oracle);
@@ -28,7 +42,6 @@ public class Main {
             node.start();
         }
 
-        // Fully connect the underlying physical overlay
         for (Node n1 : physicalNodes.values()) {
             for (Node n2 : physicalNodes.values()) {
                 if (n1.nodeId != n2.nodeId) {
@@ -40,12 +53,8 @@ public class Main {
         // 2. SECTOR B: Build Overlay Topology
         System.out.println("2. Building Broadcast Topology (Sector B)");
         LatencyMatrix latencyMatrix = new LatencyMatrix(oracle.fullMatrix(nodeIds));
-
-        // Using the Degree-Bounded Tree with a max fan-out of 2
         Topology tree = TopologyOptimizer.degreeBoundedTree(nodeIds, latencyMatrix, SOURCE_NODE, 2);
 
-        // Sector B's tree is undirected. A quick BFS figures out
-        // who is the parent and who are the children for Sector C.
         Map<Integer, Integer> parentMap = new HashMap<>();
         Map<Integer, Set<Integer>> childrenMap = new HashMap<>();
         for (int i : nodeIds) childrenMap.put(i, new HashSet<>());
@@ -67,7 +76,7 @@ public class Main {
             }
         }
 
-        // 3. SECTOR C: Start the Broadcast Engine
+        // 3. SECTOR C: Wire up the Broadcast Engine & JSON Logs
         System.out.println("3. Wiring Broadcast Engine to Transport (Sector C)");
         Map<Integer, BroadcastNode> broadcastNodes = new HashMap<>();
 
@@ -75,27 +84,26 @@ public class Main {
             final int id = i;
             Node physicalNode = physicalNodes.get(id);
 
-            // BRIDGE 1: Broadcast Engine -> Transport Layer (Sending)
-            BroadcastNode.BiSender sender = (peerId, messageId, bMsg) -> {
-                // Serialize Sector C message into Sector A string payload
-                String payload = bMsg.originId + "::" + bMsg.seqNum + "::" + bMsg.content;
-                physicalNode.send(peerId, new Message(id, "BROADCAST", payload));
-            };
-
-            BroadcastNode bNode = new BroadcastNode(id, sender);
+            // BRIDGE 1: Broadcast -> Transport
+            BroadcastNode bNode = getBroadcastNode(loggers, id, physicalNode);
             bNode.setTree(parentMap.get(id), childrenMap.get(id));
 
-            // Define what happens when a node successfully receives a message
+            // BRIDGE 2: On Delivery
             bNode.onDeliver(m -> {
                 System.out.println("[Node " + id + "] Delivered: '" + m.content + "'");
+
+                // Write "DELIVER" event to JSON Log
+                long originMs = globalOriginTimes.getOrDefault(m.messageId, System.currentTimeMillis());
+                loggers.get(id).printf("{\"event\": \"DELIVER\", \"node\": %d, \"messageId\": \"%s\", \"originMs\": %d, \"recvMs\": %d}\n",
+                        id, m.messageId, originMs, System.currentTimeMillis());
+                loggers.get(id).flush();
             });
 
             broadcastNodes.put(id, bNode);
 
-            // BRIDGE 2: Transport Layer -> Broadcast Engine (Receiving)
+            // BRIDGE 3: Transport -> Broadcast
             physicalNode.onMessage((fromPeer, rawMsg) -> {
                 if ("BROADCAST".equals(rawMsg.type)) {
-                    // Deserialize Sector A payload back into Sector C message
                     String[] parts = rawMsg.payload.split("::");
                     BroadcastMessage m = new BroadcastMessage(
                             Integer.parseInt(parts[0]),
@@ -110,15 +118,36 @@ public class Main {
         // 4. Execution & Testing
         System.out.println("4. Initiating Broadcast from Source Node " + SOURCE_NODE + "\n");
 
+        // Tracking the exact millisecond this message enters the system
+        String msgId = SOURCE_NODE + ":" + 1001;
+        globalOriginTimes.put(msgId, System.currentTimeMillis());
+
         broadcastNodes.get(SOURCE_NODE).initiateBroadcast("Project Integration Successful!", 1001);
 
-        // Give the network a couple of seconds to route all the simulated delayed packets
         Thread.sleep(2000);
 
         System.out.println("\n5. Shutting down");
         for (Node n : physicalNodes.values()) {
             n.shutdown();
         }
+        for (PrintWriter writer : loggers.values()) {
+            writer.close();
+        }
         System.exit(0);
+    }
+
+    private static BroadcastNode getBroadcastNode(Map<Integer, PrintWriter> loggers, int id, Node physicalNode) {
+        BroadcastNode.BiSender sender = (peerId, messageId, bMsg) -> {
+            // Write "SEND" event to JSON Log
+            loggers.get(id).printf("{\"event\": \"SEND\", \"node\": %d, \"messageId\": \"%s\", \"toNode\": %d}\n",
+                    id, messageId, peerId);
+            loggers.get(id).flush();
+
+            String payload = bMsg.originId + "::" + bMsg.seqNum + "::" + bMsg.content;
+            physicalNode.send(peerId, new Message(id, "BROADCAST", payload));
+        };
+
+        BroadcastNode bNode = new BroadcastNode(id, sender);
+        return bNode;
     }
 }
